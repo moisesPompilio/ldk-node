@@ -10,6 +10,7 @@
 
 pub(crate) mod logging;
 
+use ldk_node::logger::LogLevel;
 use logging::TestLogWriter;
 
 use ldk_node::config::{Config, ElectrumSyncConfig, EsploraSyncConfig};
@@ -41,6 +42,7 @@ use electrum_client::ElectrumApi;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -186,6 +188,35 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 	electrsd_conf.network = "regtest";
 	let electrsd = ElectrsD::with_conf(electrs_exe, &bitcoind, &electrsd_conf).unwrap();
 	(bitcoind, electrsd)
+}
+
+pub(crate) fn setup_bitcoind_and_electrsd_and_esplora() -> (BitcoinD, ElectrsD, ElectrsD) {
+	let bitcoind_exe =
+		env::var("BITCOIND_EXE").ok().or_else(|| corepc_node::downloaded_exe_path().ok()).expect(
+			"you need to provide an env var BITCOIND_EXE or specify a bitcoind version feature",
+		);
+	let mut bitcoind_conf = corepc_node::Conf::default();
+	bitcoind_conf.network = "regtest";
+	let bitcoind = BitcoinD::with_conf(bitcoind_exe, &bitcoind_conf).unwrap();
+
+	let electrs_exe = env::var("ELECTRS_EXE")
+		.ok()
+		.or_else(electrsd::downloaded_exe_path)
+		.expect("you need to provide env var ELECTRS_EXE or specify an electrsd version feature");
+	let mut electrsd_conf = electrsd::Conf::default();
+	electrsd_conf.http_enabled = true;
+	electrsd_conf.network = "regtest";
+	let electrsd = ElectrsD::with_conf(electrs_exe, &bitcoind, &electrsd_conf).unwrap();
+
+	let explora_exe = env::var("ELECTRS_EXE")
+		.ok()
+		.or_else(electrsd::downloaded_exe_path)
+		.expect("you need to provide env var ELECTRS_EXE or specify an electrsd version feature");
+	let mut esplora_conf = electrsd::Conf::default();
+	esplora_conf.http_enabled = true;
+	esplora_conf.network = "regtest";
+	let esplora = ElectrsD::with_conf(explora_exe, &bitcoind, &esplora_conf).unwrap();
+	(bitcoind, electrsd, esplora)
 }
 
 pub(crate) fn random_storage_path() -> PathBuf {
@@ -357,6 +388,7 @@ pub(crate) fn setup_node(
 			builder.set_custom_logger(Arc::clone(custom_log_writer));
 		},
 	}
+	// builder.set_filesystem_logger(Some("./ldk_node.log".to_string()), Some(LogLevel::Gossip));
 
 	if let Some(seed) = seed_bytes {
 		#[cfg(feature = "uniffi")]
@@ -392,7 +424,22 @@ pub(crate) fn generate_blocks_and_wait<E: ElectrumApi>(
 	let _block_hashes_res = bitcoind.generate_to_address(num, &address);
 	wait_for_block(electrs, cur_height as usize + num);
 	print!(" Done!");
-	println!("\n");
+	println!("\n")
+}
+
+pub(crate) fn invalidate_blocks(bitcoind: &BitcoindClient, num_blocks: usize) {
+	let blockchain_info = bitcoind.get_blockchain_info().expect("failed to get blockchain info");
+	let cur_height = blockchain_info.blocks as usize;
+	let target_height = cur_height - num_blocks + 1;
+	let block_hash = bitcoind
+		.get_block_hash(target_height as u64)
+		.expect("failed to get block hash")
+		.block_hash()
+		.expect("block hash should be present");
+	bitcoind.invalidate_block(block_hash).expect("failed to invalidate block");
+	let blockchain_info = bitcoind.get_blockchain_info().expect("failed to get blockchain info");
+	let new_cur_height = blockchain_info.blocks as usize;
+	assert!(new_cur_height + num_blocks == cur_height);
 }
 
 pub(crate) fn wait_for_block<E: ElectrumApi>(electrs: &E, min_height: usize) {
@@ -427,6 +474,28 @@ pub(crate) fn wait_for_tx<E: ElectrumApi>(electrs: &E, txid: Txid) {
 			electrs.ping().unwrap();
 			Some(electrs.transaction_get(&txid))
 		});
+	}
+}
+
+pub(crate) fn validate_txid_amount<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, txid: Txid,
+) {
+	println!("Validating TXID: {}", txid);
+	println!("Validating TXID: {:?}", bitcoind.get_mempool_info());
+
+	let mut test: u64 = 0;
+	loop {
+		if test > 66 {
+			return;
+			// panic!("Failed to get transaction info from electrs after 10 attempts");
+		}
+		let result = electrs.transaction_get(&txid);
+		if result.is_ok() {
+			break;
+		}
+		test += 1;
+		std::thread::sleep(Duration::from_millis(1000));
+		println!("Validating TXID: {:?}", bitcoind.get_mempool_info());
 	}
 }
 
@@ -467,19 +536,34 @@ where
 	}
 }
 
-pub(crate) fn premine_and_distribute_funds<E: ElectrumApi>(
-	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
-) {
+pub(crate) fn premine_blocks<E: ElectrumApi>(bitcoind: &BitcoindClient, electrs: &E) {
 	let _ = bitcoind.create_wallet("ldk_node_test");
 	let _ = bitcoind.load_wallet("ldk_node_test");
 	generate_blocks_and_wait(bitcoind, electrs, 101);
+}
+
+pub(crate) fn distribute_funds<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
+) -> HashMap<String, Txid> {
+	let mut address_txid_map = HashMap::new();
 
 	for addr in addrs {
 		let txid = bitcoind.send_to_address(&addr, amount).unwrap().0.parse().unwrap();
+		address_txid_map.insert(addr.to_string(), txid);
 		wait_for_tx(electrs, txid);
 	}
 
 	generate_blocks_and_wait(bitcoind, electrs, 1);
+
+	address_txid_map
+}
+
+pub(crate) fn premine_and_distribute_funds<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
+) {
+	premine_blocks(bitcoind, electrs);
+
+	distribute_funds(bitcoind, electrs, addrs, amount);
 }
 
 pub fn open_channel(
