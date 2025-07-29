@@ -88,6 +88,10 @@ jobs:
       - name: Check release build with UniFFI support on Rust ${{ matrix.toolchain }}
         if: matrix.build-uniffi
         run: cargo check --release --features uniffi --verbose --color always
+      - name: Test on Rust prop_test ${{ matrix.toolchain }}
+        if: "matrix.platform != 'windows-latest'"
+        run: |
+          RUSTFLAGS="--cfg no_download" cargo test prop_handle_reorgs -- --nocapture
       - name: Test on Rust ${{ matrix.toolchain }}
         if: "matrix.platform != 'windows-latest'"
         run: |
