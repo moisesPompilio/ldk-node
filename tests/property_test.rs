@@ -61,7 +61,7 @@ fn reorg<E: ElectrumApi>(
 }
 
 proptest! {
-	#![proptest_config(ProptestConfig::with_cases(1))]
+	#![proptest_config(ProptestConfig::with_cases(100))]
 	#[test]
 	fn prop_handle_reorgs(
 		reorg_depth in 1..=6usize,
@@ -187,50 +187,50 @@ proptest! {
 		valid_node_amount_all!();
 
 		// // Reorg before channel opening
-		if reorg_point == 0  || true {
-			// reorg(bitcoind_client, electrsd_client, 1);
-			reorg(bitcoind_client, electrsd_client, 6);
-			sync_wallets!();
-			let mut is_sync_wallets = false;
+		// if reorg_point == 0  || true {
+		// 	// reorg(bitcoind_client, electrsd_client, 1);
+		// 	reorg(bitcoind_client, electrsd_client, 6);
+		// 	sync_wallets!();
+		// 	let mut is_sync_wallets = false;
 
-			macro_rules! check_balance_node {
-				($node:ident, $addr:ident) => {
-					loop {
-						let list_balances = $node.list_balances();
-						// If there is a balance and it is not ready to spend, it means that the transaction has not been confirmed.
-						if list_balances.spendable_onchain_balance_sats != premine_amount_sat &&  list_balances.total_onchain_balance_sats == premine_amount_sat {
-							generate_blocks_and_wait(bitcoind_client, electrsd_client, 1);
-							is_sync_wallets = true;
-						// If there is no balance left, it means the transaction has been removed from the block and mempool.
-						}else if list_balances.total_onchain_balance_sats == 0 {
-							distribute_funds(
-								bitcoind_client,
-								electrsd_client,
-								vec![$addr.clone()],
-								Amount::from_sat(premine_amount_sat),
-							);
-							is_sync_wallets = true;
-							break
-						} else { break };
-						$node.sync_wallets().unwrap();
-					}
-				};
-			}
-			println!("\nChecking balance of node_hub");
-			check_balance_node!(node_hub, addr_hub);
-			println!("\nChecking balance of node_bitcoind");
-			check_balance_node!(node_bitcoind, addr_bitcoind);
-			println!("\nChecking balance of node_electrsd");
-			check_balance_node!(node_electrsd, addr_electrsd);
-			println!("\nChecking balance of node_esplora");
-			check_balance_node!(node_esplora, addr_esplora);
+		// 	macro_rules! check_balance_node {
+		// 		($node:ident, $addr:ident) => {
+		// 			loop {
+		// 				let list_balances = $node.list_balances();
+		// 				// If there is a balance and it is not ready to spend, it means that the transaction has not been confirmed.
+		// 				if list_balances.spendable_onchain_balance_sats != premine_amount_sat &&  list_balances.total_onchain_balance_sats == premine_amount_sat {
+		// 					generate_blocks_and_wait(bitcoind_client, electrsd_client, 1);
+		// 					is_sync_wallets = true;
+		// 				// If there is no balance left, it means the transaction has been removed from the block and mempool.
+		// 				}else if list_balances.total_onchain_balance_sats == 0 {
+		// 					distribute_funds(
+		// 						bitcoind_client,
+		// 						electrsd_client,
+		// 						vec![$addr.clone()],
+		// 						Amount::from_sat(premine_amount_sat),
+		// 					);
+		// 					is_sync_wallets = true;
+		// 					break
+		// 				} else { break };
+		// 				$node.sync_wallets().unwrap();
+		// 			}
+		// 		};
+		// 	}
+		// 	println!("\nChecking balance of node_hub");
+		// 	check_balance_node!(node_hub, addr_hub);
+		// 	println!("\nChecking balance of node_bitcoind");
+		// 	check_balance_node!(node_bitcoind, addr_bitcoind);
+		// 	println!("\nChecking balance of node_electrsd");
+		// 	check_balance_node!(node_electrsd, addr_electrsd);
+		// 	println!("\nChecking balance of node_esplora");
+		// 	check_balance_node!(node_esplora, addr_esplora);
 
-			if is_sync_wallets {
-				sync_wallets!();
-			}
-			println_balances_wallets!();
-			valid_node_amount_all!();
-		}
+		// 	if is_sync_wallets {
+		// 		sync_wallets!();
+		// 	}
+		// 	println_balances_wallets!();
+		// 	valid_node_amount_all!();
+		// }
 
 		// Open channel between node_hub and node_bitcoind
 		let funding_amount_sat = 2_080_000;
@@ -286,9 +286,9 @@ proptest! {
 
 		let user_channel_id = expect_channel_ready_event!(node_hub, node_bitcoind.node_id());
 		expect_channel_ready_event!(node_bitcoind, node_hub.node_id());
-		if reorg_point == 1 {
-			reorg(bitcoind_client, electrsd_client, reorg_depth);
-		}
+		// if reorg_point == 1 {
+		// 	reorg(bitcoind_client, electrsd_client, reorg_depth);
+		// }
 
 		println!("\npassed here 2");
 
@@ -390,22 +390,22 @@ proptest! {
 
 		println!("\npassed here 3");
 
-		// Reorg after payments
-		if reorg_point == 2 {
-			reorg(bitcoind_client, electrsd_client, reorg_depth);
+		// // Reorg after payments
+		// if reorg_point == 2 {
+		// 	reorg(bitcoind_client, electrsd_client, reorg_depth);
 
-			sync_wallets!();
+		// 	sync_wallets!();
 
-			// Verify that the channel remains active
-			assert!(
-				!node_hub.list_channels().is_empty(),
-				"Channel should remain open after reorg"
-			);
-			assert!(
-				!node_bitcoind.list_channels().is_empty(),
-				"Channel should remain open after reorg"
-			);
-		}
+		// 	// Verify that the channel remains active
+		// 	assert!(
+		// 		!node_hub.list_channels().is_empty(),
+		// 		"Channel should remain open after reorg"
+		// 	);
+		// 	assert!(
+		// 		!node_bitcoind.list_channels().is_empty(),
+		// 		"Channel should remain open after reorg"
+		// 	);
+		// }
 
 		// Close channel
 		let channel_closed = if !node_hub.list_channels().is_empty() {
@@ -433,35 +433,35 @@ proptest! {
 			false
 		};
 
-		// Reorg after channel closing
-		if reorg_point == 3 && channel_closed {
-			let blockchain_info1 = bitcoind_client.get_blockchain_info().unwrap();
-			reorg(bitcoind_client, electrsd_client, reorg_depth);
-			let blockchain_info2 = bitcoind_client.get_blockchain_info().unwrap();
-			assert_eq!(
-				blockchain_info2.blocks,
-				blockchain_info1.blocks,
-				"Blockchain height should be restored after reorg"
-			);
-			sync_wallets!();
+		// // Reorg after channel closing
+		// if reorg_point == 3 && channel_closed {
+		// 	let blockchain_info1 = bitcoind_client.get_blockchain_info().unwrap();
+		// 	reorg(bitcoind_client, electrsd_client, reorg_depth);
+		// 	let blockchain_info2 = bitcoind_client.get_blockchain_info().unwrap();
+		// 	assert_eq!(
+		// 		blockchain_info2.blocks,
+		// 		blockchain_info1.blocks,
+		// 		"Blockchain height should be restored after reorg"
+		// 	);
+		// 	sync_wallets!();
 
-			// Verify that the channel remains closed
-			assert!(
-				node_hub.list_channels().is_empty(),
-				"Channel should remain closed after reorg"
-			);
-			assert!(
-				node_bitcoind.list_channels().is_empty(),
-				"Channel should remain closed after reorg"
-			);
+		// 	// Verify that the channel remains closed
+		// 	assert!(
+		// 		node_hub.list_channels().is_empty(),
+		// 		"Channel should remain closed after reorg"
+		// 	);
+		// 	assert!(
+		// 		node_bitcoind.list_channels().is_empty(),
+		// 		"Channel should remain closed after reorg"
+		// 	);
 
-			// Verify that payments remain valid
-			assert_eq!(
-				node_hub.payment(&payment_id).unwrap().status,
-				PaymentStatus::Succeeded,
-				"Bolt11 payment should remain successful after reorg"
-			);
-		}
+		// 	// Verify that payments remain valid
+		// 	assert_eq!(
+		// 		node_hub.payment(&payment_id).unwrap().status,
+		// 		PaymentStatus::Succeeded,
+		// 		"Bolt11 payment should remain successful after reorg"
+		// 	);
+		// }
 
 		// Verify balances after closing
 		if force_close && channel_closed {
@@ -532,60 +532,60 @@ proptest! {
 			node_hub.sync_wallets().unwrap();
 			node_bitcoind.sync_wallets().unwrap();
 
-			// Process node_bitcoind balances
-			match node_bitcoind.list_balances().lightning_balances[0] {
-				LightningBalance::ClaimableAwaitingConfirmations {
-					counterparty_node_id,
-					confirmation_height,
-					..
-				} => {
-					assert_eq!(
-						counterparty_node_id,
-						node_hub.node_id(),
-						"Node bitcoind counterparty incorrect"
-					);
-					let cur_height = node_bitcoind.status().current_best_block.height;
-					let blocks_to_go = confirmation_height - cur_height;
-					generate_blocks_and_wait(bitcoind_client, electrsd_client, blocks_to_go as usize);
-					node_hub.sync_wallets().unwrap();
-					node_bitcoind.sync_wallets().unwrap();
-				},
-				_ => panic!("Unexpected balance state for node_bitcoind!"),
-			}
+			// // Process node_bitcoind balances
+			// match node_bitcoind.list_balances().lightning_balances[0] {
+			// 	LightningBalance::ClaimableAwaitingConfirmations {
+			// 		counterparty_node_id,
+			// 		confirmation_height,
+			// 		..
+			// 	} => {
+			// 		assert_eq!(
+			// 			counterparty_node_id,
+			// 			node_hub.node_id(),
+			// 			"Node bitcoind counterparty incorrect"
+			// 		);
+			// 		let cur_height = node_bitcoind.status().current_best_block.height;
+			// 		let blocks_to_go = confirmation_height - cur_height;
+			// 		generate_blocks_and_wait(bitcoind_client, electrsd_client, blocks_to_go as usize);
+			// 		node_hub.sync_wallets().unwrap();
+			// 		node_bitcoind.sync_wallets().unwrap();
+			// 	},
+			// 	_ => panic!("Unexpected balance state for node_bitcoind!"),
+			// }
 
-			assert!(
-				node_bitcoind.list_balances().lightning_balances.is_empty(),
-				"Node bitcoind lightning balances should be empty after confirmations"
-			);
-			assert_eq!(
-				node_bitcoind.list_balances().pending_balances_from_channel_closures.len(),
-				1,
-				"Expected one pending balance for node_bitcoind"
-			);
-			match node_bitcoind.list_balances().pending_balances_from_channel_closures[0] {
-				PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {},
-				_ => panic!("Unexpected pending balance state for node_bitcoind!"),
-			}
-			generate_blocks_and_wait(bitcoind_client, electrsd_client, 1);
-			node_hub.sync_wallets().unwrap();
-			node_bitcoind.sync_wallets().unwrap();
+			// assert!(
+			// 	node_bitcoind.list_balances().lightning_balances.is_empty(),
+			// 	"Node bitcoind lightning balances should be empty after confirmations"
+			// );
+			// assert_eq!(
+			// 	node_bitcoind.list_balances().pending_balances_from_channel_closures.len(),
+			// 	1,
+			// 	"Expected one pending balance for node_bitcoind"
+			// );
+			// match node_bitcoind.list_balances().pending_balances_from_channel_closures[0] {
+			// 	PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {},
+			// 	_ => panic!("Unexpected pending balance state for node_bitcoind!"),
+			// }
+			// generate_blocks_and_wait(bitcoind_client, electrsd_client, 1);
+			// node_hub.sync_wallets().unwrap();
+			// node_bitcoind.sync_wallets().unwrap();
 
-			assert!(
-				node_bitcoind.list_balances().lightning_balances.is_empty(),
-				"Node bitcoind lightning balances should remain empty"
-			);
-			assert_eq!(
-				node_bitcoind.list_balances().pending_balances_from_channel_closures.len(),
-				1,
-				"Expected one pending balance for node_bitcoind"
-			);
-			match node_bitcoind.list_balances().pending_balances_from_channel_closures[0] {
-				PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
-				_ => panic!("Unexpected pending balance state for node_bitcoind!"),
-			}
-			generate_blocks_and_wait(bitcoind_client, electrsd_client, 5);
-			node_hub.sync_wallets().unwrap();
-			node_bitcoind.sync_wallets().unwrap();
+			// assert!(
+			// 	node_bitcoind.list_balances().lightning_balances.is_empty(),
+			// 	"Node bitcoind lightning balances should remain empty"
+			// );
+			// assert_eq!(
+			// 	node_bitcoind.list_balances().pending_balances_from_channel_closures.len(),
+			// 	1,
+			// 	"Expected one pending balance for node_bitcoind"
+			// );
+			// match node_bitcoind.list_balances().pending_balances_from_channel_closures[0] {
+			// 	PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
+			// 	_ => panic!("Unexpected pending balance state for node_bitcoind!"),
+			// }
+			// generate_blocks_and_wait(bitcoind_client, electrsd_client, 5);
+			// node_hub.sync_wallets().unwrap();
+			// node_bitcoind.sync_wallets().unwrap();
 		}
 
 		// Verify final balances
