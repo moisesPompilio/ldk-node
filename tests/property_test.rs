@@ -188,8 +188,8 @@ proptest! {
 
 		// // Reorg before channel opening
 		if reorg_point == 0  || true {
-			reorg(bitcoind_client, electrsd_client, 1);
-			// reorg(bitcoind_client, electrsd_client, 6);
+			// reorg(bitcoind_client, electrsd_client, 1);
+			reorg(bitcoind_client, electrsd_client, 6);
 			sync_wallets!();
 			let mut is_sync_wallets = false;
 
