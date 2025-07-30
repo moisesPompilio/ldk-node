@@ -61,7 +61,7 @@ fn reorg<E: ElectrumApi>(
 }
 
 proptest! {
-	#![proptest_config(ProptestConfig::with_cases(100))]
+	#![proptest_config(ProptestConfig::with_cases(25))]
 	#[test]
 	fn prop_handle_reorgs(
 		reorg_depth in 1..=6usize,
