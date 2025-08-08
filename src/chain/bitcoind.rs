@@ -38,6 +38,7 @@ use serde::Serialize;
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, FeeRate, Network, Transaction, Txid};
 
 use std::collections::{HashMap, VecDeque};
@@ -1121,7 +1122,12 @@ impl BitcoindClient {
 		let mempool_entries_cache = mempool_entries_cache.lock().await;
 		let evicted_txids = unconfirmed_txids
 			.into_iter()
-			.filter(|txid| mempool_entries_cache.contains_key(txid))
+			.filter(|txid| {
+				let mut bytes = txid.to_byte_array();
+				bytes.reverse();
+				let normalized_txid = Txid::from_byte_array(bytes);
+				!mempool_entries_cache.contains_key(&normalized_txid)
+			})
 			.map(|txid| (txid, latest_mempool_timestamp))
 			.collect();
 		Ok(evicted_txids)
