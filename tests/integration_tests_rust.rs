@@ -12,7 +12,7 @@ use common::{
 	expect_payment_received_event, expect_payment_successful_event, generate_blocks_and_wait,
 	logging::{init_log_logger, validate_log_entry, TestLogWriter},
 	open_channel, premine_and_distribute_funds, random_config, random_listening_addresses,
-	setup_bitcoind_and_electrsd, setup_builder, setup_node, setup_two_nodes, wait_for_tx,
+	setup_bitcoind_and_electrsd, setup_builder, setup_node, setup_two_nodes, wait_for_tx, SetupRBF,
 	TestChainSource, TestSyncStore,
 };
 
@@ -1387,5 +1387,94 @@ fn facade_logging() {
 	assert!(!logger.retrieve_logs().is_empty());
 	for (_, entry) in logger.retrieve_logs().iter().enumerate() {
 		validate_log_entry(entry);
+	}
+}
+
+#[test]
+fn test_rbf_value() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let setup = SetupRBF::new(&bitcoind, &electrsd);
+	let amount = 2_125_000;
+	let value = 21_000;
+
+	let (bitcoind, electrs) = (&bitcoind.client, &electrsd.client);
+	let txid = setup.setup_initial_funding(bitcoind, electrs, amount);
+
+	setup.sync_wallets();
+	setup.validate_balances(&setup.nodes_a, amount, false);
+	setup.validate_balances(&setup.nodes_b, amount, false);
+
+	let (mut original_tx, add_scripts, subtract_scripts, fee_output_index) =
+		setup.init_rbf(electrs, txid);
+	original_tx.output.iter_mut().for_each(|output| {
+		if add_scripts.contains(&output.script_pubkey) {
+			output.value = Amount::from_sat(output.value.to_sat() + value);
+		} else if subtract_scripts.contains(&output.script_pubkey) {
+			output.value = Amount::from_sat(output.value.to_sat().saturating_sub(value));
+		}
+	});
+
+	setup.pump_fee_with_rbf_replacement(bitcoind, electrs, &mut original_tx, fee_output_index);
+
+	setup.sync_wallets();
+	setup.validate_balances(&setup.nodes_a, amount + value, false);
+	setup.validate_balances(&setup.nodes_b, amount - value, false);
+
+	generate_blocks_and_wait(bitcoind, electrs, 1);
+
+	setup.sync_wallets();
+	setup.validate_balances(&setup.nodes_a, amount + value, true);
+	setup.validate_balances(&setup.nodes_b, amount - value, true);
+
+	let funding = 1_500_00;
+	let should_announce = true;
+	for index_node in 0..setup.nodes_a.len() {
+		let node_add = &setup.nodes_a[index_node];
+		let node_subtract = &setup.nodes_b[index_node];
+		open_channel(node_add, node_subtract, funding, should_announce, &electrsd);
+		open_channel(node_subtract, node_add, funding, should_announce, &electrsd);
+	}
+}
+
+#[test]
+fn test_rbf_output() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let setup = SetupRBF::new(&bitcoind, &electrsd);
+	let amount = 2_125_000;
+
+	let (bitcoind, electrs) = (&bitcoind.client, &electrsd.client);
+	let txid = setup.setup_initial_funding(bitcoind, electrs, amount);
+	println!("\n Transacao que deve ir embora: {}\n", txid);
+
+	setup.sync_wallets();
+	setup.validate_balances(&setup.nodes_a, amount, false);
+	setup.validate_balances(&setup.nodes_b, amount, false);
+
+	let (mut original_tx, _, modify_scripts, fee_output_index) = setup.init_rbf(electrs, txid);
+	original_tx.output.iter_mut().for_each(|output| {
+		if modify_scripts.contains(&output.script_pubkey) {
+			let new_addr = bitcoind.new_address().unwrap();
+			output.script_pubkey = new_addr.script_pubkey();
+		}
+	});
+
+	setup.pump_fee_with_rbf_replacement(bitcoind, electrs, &mut original_tx, fee_output_index);
+
+	setup.sync_wallets();
+	setup.validate_balances(&setup.nodes_a, amount, false);
+	setup.validate_balances(&setup.nodes_b, 0, false);
+
+	generate_blocks_and_wait(bitcoind, electrs, 1);
+
+	setup.sync_wallets();
+	setup.validate_balances(&setup.nodes_a, amount, true);
+	setup.validate_balances(&setup.nodes_b, 0, true);
+
+	let funding = 1_500_00;
+	let should_announce = true;
+	for index_node in 0..setup.nodes_a.len() {
+		let node_static = &setup.nodes_a[index_node];
+		let node_modify = &setup.nodes_b[index_node];
+		open_channel(node_static, node_modify, funding, should_announce, &electrsd);
 	}
 }

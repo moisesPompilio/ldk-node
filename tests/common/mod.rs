@@ -29,9 +29,12 @@ use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
 use lightning_persister::fs_store::FilesystemStore;
 
+use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Amount, Network, OutPoint, Txid};
+use bitcoin::{
+	Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, Txid, Witness,
+};
 
 use electrsd::corepc_node::Client as BitcoindClient;
 use electrsd::corepc_node::Node as BitcoinD;
@@ -40,7 +43,9 @@ use electrum_client::ElectrumApi;
 
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
+use serde_json::{json, Value};
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -470,16 +475,47 @@ where
 pub(crate) fn premine_and_distribute_funds<E: ElectrumApi>(
 	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
 ) {
+	premine_blocks(bitcoind, electrs);
+
+	distribute_funds(bitcoind, electrs, addrs, amount);
+}
+
+pub(crate) fn premine_blocks<E: ElectrumApi>(bitcoind: &BitcoindClient, electrs: &E) {
 	let _ = bitcoind.create_wallet("ldk_node_test");
 	let _ = bitcoind.load_wallet("ldk_node_test");
 	generate_blocks_and_wait(bitcoind, electrs, 101);
+}
 
-	for addr in addrs {
-		let txid = bitcoind.send_to_address(&addr, amount).unwrap().0.parse().unwrap();
-		wait_for_tx(electrs, txid);
+pub(crate) fn distribute_funds_unconfirmed<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
+) -> Txid {
+	let mut amounts = HashMap::<String, f64>::new();
+	for addr in &addrs {
+		amounts.insert(addr.to_string(), amount.to_btc());
 	}
 
+	let empty_account = json!("");
+	let amounts_json = json!(amounts);
+	let txid = bitcoind
+		.call::<Value>("sendmany", &[empty_account, amounts_json])
+		.unwrap()
+		.as_str()
+		.unwrap()
+		.parse()
+		.unwrap();
+
+	wait_for_tx(electrs, txid);
+
+	txid
+}
+
+pub(crate) fn distribute_funds<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
+) -> Txid {
+	let address_txid_map = distribute_funds_unconfirmed(bitcoind, electrs, addrs, amount);
 	generate_blocks_and_wait(bitcoind, electrs, 1);
+
+	address_txid_map
 }
 
 pub fn open_channel(
@@ -1072,6 +1108,161 @@ pub(crate) fn do_channel_full_cycle<E: ElectrumApi>(
 	println!("\nA stopped");
 	node_b.stop().unwrap();
 	println!("\nB stopped");
+}
+
+pub(crate) struct SetupRBF {
+	pub nodes_a: Vec<TestNode>,
+	pub nodes_b: Vec<TestNode>,
+	pub addrs_a: Vec<Address>,
+	pub addrs_b: Vec<Address>,
+}
+
+impl SetupRBF {
+	pub(crate) fn new(bitcoind: &BitcoinD, electrsd: &ElectrsD) -> Self {
+		let chain_source_bitcoind = TestChainSource::BitcoindRpcSync(bitcoind);
+		let chain_source_electrum = TestChainSource::Electrum(electrsd);
+		let chain_source_esplora = TestChainSource::Esplora(electrsd);
+
+		let (node_bitcoind_a, node_bitcoind_b) =
+			setup_two_nodes(&chain_source_bitcoind, false, false, false);
+		let (node_electrsd_a, node_electrsd_b) =
+			setup_two_nodes(&chain_source_electrum, false, false, false);
+		let (node_esplora_a, node_esplora_b) =
+			setup_two_nodes(&chain_source_esplora, false, false, false);
+
+		let nodes_a = vec![node_bitcoind_a, node_electrsd_a, node_esplora_a];
+		let nodes_b = vec![node_bitcoind_b, node_electrsd_b, node_esplora_b];
+
+		let addrs_a = nodes_a
+			.iter()
+			.map(|node| node.onchain_payment().new_address().unwrap())
+			.collect::<Vec<_>>();
+		let addrs_b = nodes_b
+			.iter()
+			.map(|node| node.onchain_payment().new_address().unwrap())
+			.collect::<Vec<_>>();
+
+		Self { nodes_a, nodes_b, addrs_a, addrs_b }
+	}
+
+	pub(crate) fn sync_wallets(&self) {
+		for node in &self.nodes_a {
+			node.sync_wallets().unwrap();
+		}
+		for node in &self.nodes_b {
+			node.sync_wallets().unwrap();
+		}
+	}
+
+	pub(crate) fn validate_balances(
+		&self, nodes: &[TestNode], expected_balance: u64, is_spendable: bool,
+	) {
+		let spend_balance = if is_spendable { expected_balance } else { 0 };
+		for node in nodes.iter() {
+			assert_eq!(node.list_balances().total_onchain_balance_sats, expected_balance);
+			assert_eq!(node.list_balances().spendable_onchain_balance_sats, spend_balance);
+		}
+	}
+
+	pub(crate) fn setup_initial_funding<E: ElectrumApi>(
+		&self, bitcoind: &BitcoindClient, electrs: &E, amount: u64,
+	) -> bitcoin::Txid {
+		premine_blocks(bitcoind, electrs);
+		let all_addrs = self.addrs_a.iter().chain(self.addrs_b.iter()).cloned().collect::<Vec<_>>();
+		distribute_funds_unconfirmed(bitcoind, electrs, all_addrs, Amount::from_sat(amount))
+	}
+
+	pub(crate) fn pump_fee_with_rbf_replacement<E: ElectrumApi>(
+		&self, bitcoind: &BitcoindClient, electrs: &E, original_tx: &mut Transaction,
+		fee_output_index: usize,
+	) -> Txid {
+		let mut pump_fee_amount = 1 * original_tx.vsize() as u64;
+
+		macro_rules! bump_fee {
+			() => {{
+				let fee_output = &mut original_tx.output[fee_output_index];
+				let new_fee_value = fee_output.value.to_sat().saturating_sub(pump_fee_amount);
+				fee_output.value = Amount::from_sat(new_fee_value);
+
+				if new_fee_value < 546 {
+					// dust limit
+					panic!("Warning: Fee output approaching dust limit ({} sats)", new_fee_value);
+				}
+
+				pump_fee_amount += pump_fee_amount * 5;
+
+				for input in &mut original_tx.input {
+					input.sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
+					input.script_sig = ScriptBuf::new();
+					input.witness = Witness::new();
+				}
+
+				let signed_result =
+					bitcoind.sign_raw_transaction_with_wallet(&original_tx).unwrap();
+				assert!(signed_result.complete, "Failed to sign RBF transaction");
+
+				let tx_bytes = Vec::<u8>::from_hex(&signed_result.hex).unwrap();
+				let tx = bitcoin::consensus::encode::deserialize::<Transaction>(&tx_bytes).unwrap();
+
+				tx
+			}};
+		}
+
+		for _attempt in 0..3 {
+			let tx = bump_fee!();
+			match bitcoind.send_raw_transaction(&tx) {
+				Ok(res) => {
+					let new_txid = res.0.parse().unwrap();
+					wait_for_tx(electrs, new_txid);
+					println!("New txid from the RBF: {}", new_txid);
+					return new_txid;
+				},
+				Err(_) => {
+					if original_tx.output[fee_output_index].value.to_sat() < pump_fee_amount {
+						panic!("Insufficient funds to increase fee");
+					}
+				},
+			}
+		}
+
+		panic!("Failed to pump fee after 3 attempts");
+	}
+
+	pub(crate) fn init_rbf<E: ElectrumApi>(
+		&self, electrs: &E, original_txid: Txid,
+	) -> (Transaction, HashSet<ScriptBuf>, HashSet<ScriptBuf>, usize) {
+		let original_tx: Transaction = electrs.transaction_get(&original_txid).unwrap();
+
+		let total_addresses_to_modify = &self.addrs_a.len() + &self.addrs_b.len();
+		if original_tx.output.len() <= total_addresses_to_modify {
+			panic!(
+				"Transaction must have more outputs ({}) than addresses to modify ({}) to allow fee pumping",
+				original_tx.output.len(),
+				total_addresses_to_modify
+			);
+		}
+
+		let scripts_a: HashSet<ScriptBuf> =
+			self.addrs_a.iter().map(|addr| addr.script_pubkey()).collect();
+		let scripts_b: HashSet<ScriptBuf> =
+			self.addrs_b.iter().map(|addr| addr.script_pubkey()).collect();
+
+		let mut fee_output_index: Option<usize> = None;
+		for (index, output) in original_tx.output.iter().enumerate() {
+			if !scripts_a.contains(&output.script_pubkey)
+				&& !scripts_b.contains(&output.script_pubkey)
+			{
+				fee_output_index = Some(index);
+				break;
+			}
+		}
+
+		let fee_output_index = fee_output_index.expect(
+			"No output available for fee pumping. Need at least one output not being modified.",
+		);
+
+		(original_tx, scripts_a, scripts_b, fee_output_index)
+	}
 }
 
 // A `KVStore` impl for testing purposes that wraps all our `KVStore`s and asserts their synchronicity.
