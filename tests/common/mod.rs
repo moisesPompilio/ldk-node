@@ -31,7 +31,7 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Amount, Network, OutPoint, Txid};
+use bitcoin::{Address, Amount, Network, OutPoint, Transaction, Txid};
 
 use electrsd::corepc_node::Client as BitcoindClient;
 use electrsd::corepc_node::Node as BitcoinD;
@@ -487,12 +487,33 @@ where
 pub(crate) fn premine_and_distribute_funds<E: ElectrumApi>(
 	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
 ) {
+	premine_blocks(bitcoind, electrs);
+
+	distribute_funds(bitcoind, electrs, addrs, amount);
+}
+
+pub(crate) fn premine_blocks<E: ElectrumApi>(bitcoind: &BitcoindClient, electrs: &E) {
 	let _ = bitcoind.create_wallet("ldk_node_test");
 	let _ = bitcoind.load_wallet("ldk_node_test");
 	generate_blocks_and_wait(bitcoind, electrs, 101);
+}
 
-	let amounts: HashMap<String, f64> =
-		addrs.iter().map(|addr| (addr.to_string(), amount.to_btc())).collect();
+pub(crate) fn distribute_funds<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
+) -> Txid {
+	let address_txid_map = distribute_funds_unconfirmed(bitcoind, electrs, addrs, amount);
+	generate_blocks_and_wait(bitcoind, electrs, 1);
+
+	address_txid_map
+}
+
+pub(crate) fn distribute_funds_unconfirmed<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, addrs: Vec<Address>, amount: Amount,
+) -> Txid {
+	let mut amounts = HashMap::<String, f64>::new();
+	for addr in &addrs {
+		amounts.insert(addr.to_string(), amount.to_btc());
+	}
 
 	let empty_account = json!("");
 	let amounts_json = json!(amounts);
@@ -505,7 +526,12 @@ pub(crate) fn premine_and_distribute_funds<E: ElectrumApi>(
 		.unwrap();
 
 	wait_for_tx(electrs, txid);
-	generate_blocks_and_wait(bitcoind, electrs, 1);
+
+	txid
+}
+
+pub(crate) fn get_transaction<E: ElectrumApi>(electrs: &E, txid: Txid) -> Transaction {
+	electrs.transaction_get(&txid).unwrap()
 }
 
 pub fn open_channel(

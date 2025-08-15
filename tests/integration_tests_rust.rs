@@ -10,6 +10,7 @@ mod common;
 use common::{
 	do_channel_full_cycle, expect_channel_pending_event, expect_channel_ready_event, expect_event,
 	expect_payment_received_event, expect_payment_successful_event, generate_blocks_and_wait,
+	get_transaction,
 	logging::{init_log_logger, validate_log_entry, TestLogWriter},
 	open_channel, premine_and_distribute_funds, random_config, random_listening_addresses,
 	setup_bitcoind_and_electrsd, setup_builder, setup_node, setup_two_nodes, wait_for_tx,
@@ -32,14 +33,17 @@ use lightning_invoice::{Bolt11InvoiceDescription, Description};
 use lightning_types::payment::PaymentPreimage;
 
 use bitcoin::address::NetworkUnchecked;
+use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
-use bitcoin::Address;
-use bitcoin::Amount;
+use bitcoin::{Address, Amount, ScriptBuf, Sequence, Transaction, Witness};
 use log::LevelFilter;
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use crate::common::{distribute_funds_unconfirmed, premine_blocks};
 
 #[test]
 fn channel_full_cycle() {
@@ -667,6 +671,219 @@ fn onchain_wallet_recovery() {
 		recovered_node.list_balances().spendable_onchain_balance_sats,
 		premine_amount_sat * 3
 	);
+}
+
+#[test]
+fn test_rbf_via_mempool() {
+	run_rbf_test(false);
+}
+
+#[test]
+fn test_rbf_via_direct_block_insertion() {
+	run_rbf_test(true);
+}
+
+// `is_insert_block`:
+// - `true`: transaction is mined immediately (no mempool), testing confirmed-Tx handling.
+// - `false`: transaction stays in mempool until confirmation, testing unconfirmed-Tx handling.
+fn run_rbf_test(is_insert_block: bool) {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source_bitcoind = TestChainSource::BitcoindRpcSync(&bitcoind);
+	let chain_source_electrsd = TestChainSource::Electrum(&electrsd);
+	let chain_source_esplora = TestChainSource::Esplora(&electrsd);
+
+	macro_rules! config_node {
+		($chain_source: expr, $anchor_channels: expr) => {{
+			let config_a = random_config($anchor_channels);
+			let node = setup_node(&$chain_source, config_a, None);
+			node
+		}};
+	}
+	let anchor_channels = false;
+	let nodes = vec![
+		config_node!(chain_source_electrsd, anchor_channels),
+		config_node!(chain_source_bitcoind, anchor_channels),
+		config_node!(chain_source_esplora, anchor_channels),
+	];
+
+	let (bitcoind, electrs) = (&bitcoind.client, &electrsd.client);
+	premine_blocks(bitcoind, electrs);
+
+	// Helpers declaration before starting the test
+	let all_addrs =
+		nodes.iter().map(|node| node.onchain_payment().new_address().unwrap()).collect::<Vec<_>>();
+	let amount_sat = 2_100_000;
+	let mut txid;
+	macro_rules! distribute_funds_all_nodes {
+		() => {
+			txid = distribute_funds_unconfirmed(
+				bitcoind,
+				electrs,
+				all_addrs.clone(),
+				Amount::from_sat(amount_sat),
+			);
+		};
+	}
+
+	let mut tx;
+	let scripts_buf: HashSet<ScriptBuf> =
+		all_addrs.iter().map(|addr| addr.script_pubkey()).collect();
+	let mut fee_output_index;
+	macro_rules! prepare_rbf {
+		() => {
+			tx = get_transaction(electrs, txid);
+
+			let mut option_fee_output_index = None;
+			for (index, output) in tx.output.iter().enumerate() {
+				if !scripts_buf.contains(&output.script_pubkey) {
+					option_fee_output_index = Some(index);
+					break;
+				}
+			}
+			fee_output_index = option_fee_output_index.expect(
+				"No output available for fee pumping. Need at least one output not being modified.",
+			);
+		};
+	}
+
+	let mut bump_fee_amount_sat;
+	macro_rules! bump_fee_rbf_and_public_transaction {
+		() => {
+			bump_fee_amount_sat = tx.vsize() as u64;
+			let attempts = 5;
+			for _attempt in 0..attempts {
+				bump_fee!();
+				println!("Bumping fee to {} sats", bump_fee_amount_sat);
+				println!("Transaction ID: {}", tx.compute_txid());
+				match bitcoind.send_raw_transaction(&tx) {
+					Ok(res) => {
+						// Mine a block immediately so the transaction is confirmed
+						// before any node identifies it as a transaction that was in the mempool.
+						if is_insert_block {
+							generate_blocks_and_wait(bitcoind, electrs, 1);
+						}
+						let new_txid = res.0.parse().unwrap();
+						wait_for_tx(electrs, new_txid);
+						break;
+					},
+					Err(_) => {
+						if _attempt == attempts - 1 {
+							panic!("Failed to pump fee after {} attempts", attempts);
+						}
+
+						bump_fee_amount_sat += bump_fee_amount_sat * 5;
+						if tx.output[fee_output_index].value.to_sat() < bump_fee_amount_sat {
+							panic!("Insufficient funds to increase fee");
+						}
+					},
+				}
+			}
+		};
+	}
+
+	macro_rules! bump_fee {
+		() => {
+			let fee_output = &mut tx.output[fee_output_index];
+			let new_fee_value = fee_output.value.to_sat().saturating_sub(bump_fee_amount_sat);
+			fee_output.value = Amount::from_sat(new_fee_value);
+			println!("New fee value: {} sats", new_fee_value);
+
+			// dust limit
+			if new_fee_value < 546 {
+				panic!("Warning: Fee output approaching dust limit ({} sats)", new_fee_value);
+			}
+
+			for input in &mut tx.input {
+				input.sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
+				input.script_sig = ScriptBuf::new();
+				input.witness = Witness::new();
+			}
+
+			let signed_result = bitcoind.sign_raw_transaction_with_wallet(&tx).unwrap();
+			assert!(signed_result.complete, "Failed to sign RBF transaction");
+
+			let tx_bytes = Vec::<u8>::from_hex(&signed_result.hex).unwrap();
+			tx = bitcoin::consensus::encode::deserialize::<Transaction>(&tx_bytes).unwrap();
+		};
+	}
+
+	macro_rules! validate_balances {
+		($expected_balance_sat: expr, $is_spendable: expr) => {
+			let spend_balance = if $is_spendable { $expected_balance_sat } else { 0 };
+			for node in &nodes {
+				node.sync_wallets().unwrap();
+				let balances = node.list_balances();
+				assert_eq!(balances.spendable_onchain_balance_sats, spend_balance);
+				assert_eq!(balances.total_onchain_balance_sats, $expected_balance_sat);
+			}
+		};
+	}
+
+	// Modify the output to the nodes
+	distribute_funds_all_nodes!();
+	validate_balances!(amount_sat, false);
+	prepare_rbf!();
+	tx.output.iter_mut().for_each(|output| {
+		if scripts_buf.contains(&output.script_pubkey) {
+			let new_addr = bitcoind.new_address().unwrap();
+			output.script_pubkey = new_addr.script_pubkey();
+		}
+	});
+	bump_fee_rbf_and_public_transaction!();
+	validate_balances!(0, is_insert_block);
+
+	// Not modifying the output scripts, but still bumping the fee.
+	distribute_funds_all_nodes!();
+	validate_balances!(amount_sat, false);
+	prepare_rbf!();
+	bump_fee_rbf_and_public_transaction!();
+	validate_balances!(amount_sat, is_insert_block);
+
+	let mut final_amount_sat = amount_sat * 2;
+	let value_sat = 21_000;
+
+	// Increase the value of the nodes' outputs
+	distribute_funds_all_nodes!();
+	prepare_rbf!();
+	tx.output.iter_mut().for_each(|output| {
+		if scripts_buf.contains(&output.script_pubkey) {
+			output.value = Amount::from_sat(output.value.to_sat() + value_sat);
+		}
+	});
+	bump_fee_rbf_and_public_transaction!();
+	final_amount_sat += value_sat;
+	validate_balances!(final_amount_sat, is_insert_block);
+
+	// Decreases the value of the nodes' outputs
+	distribute_funds_all_nodes!();
+	final_amount_sat += amount_sat;
+	prepare_rbf!();
+	tx.output.iter_mut().for_each(|output| {
+		if scripts_buf.contains(&output.script_pubkey) {
+			output.value = Amount::from_sat(output.value.to_sat() - value_sat);
+		}
+	});
+	bump_fee_rbf_and_public_transaction!();
+	final_amount_sat -= value_sat;
+	validate_balances!(final_amount_sat, is_insert_block);
+
+	if !is_insert_block {
+		generate_blocks_and_wait(bitcoind, electrs, 1);
+		validate_balances!(final_amount_sat, true);
+	}
+
+	// Check if it is possible to send all funds from the node
+	let mut txids = Vec::new();
+	let addr = bitcoind.new_address().unwrap();
+	nodes.iter().for_each(|node| {
+		let txid = node.onchain_payment().send_all_to_address(&addr, true, None).unwrap();
+		txids.push(txid);
+	});
+	txids.iter().for_each(|txid| {
+		wait_for_tx(electrs, *txid);
+	});
+	generate_blocks_and_wait(bitcoind, electrs, 6);
+	validate_balances!(0, true);
 }
 
 #[test]
