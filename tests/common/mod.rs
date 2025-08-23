@@ -10,13 +10,16 @@
 
 pub(crate) mod logging;
 
+use electrsd::corepc_client::client_sync::Auth;
 use logging::TestLogWriter;
 
+use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::config::{Config, ElectrumSyncConfig, EsploraSyncConfig};
 use ldk_node::io::sqlite_store::SqliteStore;
 use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{
 	Builder, CustomTlvRecord, Event, LightningBalance, Node, NodeError, PendingSweepBalance,
+	UserChannelId,
 };
 
 use lightning::ln::msgs::SocketAddress;
@@ -24,7 +27,7 @@ use lightning::routing::gossip::NodeAlias;
 use lightning::util::persist::KVStore;
 use lightning::util::test_utils::TestStore;
 
-use lightning_invoice::{Bolt11InvoiceDescription, Description};
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
 use lightning_persister::fs_store::FilesystemStore;
@@ -38,6 +41,7 @@ use bitcoin::{
 use electrsd::corepc_node::Client as BitcoindClient;
 use electrsd::corepc_node::Node as BitcoinD;
 use electrsd::{corepc_node, ElectrsD};
+use electrum_client::Client as ElectrumClient;
 use electrum_client::ElectrumApi;
 
 use rand::distributions::Alphanumeric;
@@ -47,6 +51,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -1323,4 +1328,145 @@ impl KVStore for TestSyncStore {
 		let _guard = self.serializer.read().unwrap();
 		self.do_list(primary_namespace, secondary_namespace)
 	}
+}
+
+pub trait ExternalLightningNode {
+	fn get_node_info(&mut self) -> (PublicKey, SocketAddress);
+	fn create_invoice(&mut self, amount_msat: u64, description: String) -> String;
+	fn pay_invoice(&mut self, invoice: &str);
+	fn check_receive_payment(&mut self, quantity_invoices: usize);
+	fn description_invoice(&mut self) -> String {
+		"externalNodeTest".to_string()
+	}
+	/// only needed for implementations that require a short delay to update routes/balances after receiving funds (e.g. LND).
+	fn can_send_payment(&mut self, _: String, _: u64) -> bool {
+		// Default implementation, can be overridden
+		true
+	}
+}
+
+fn init_setup_test_external_node() -> (Node, BitcoindClient, ElectrumClient) {
+	// Setup bitcoind / electrs clients
+	let bitcoind_client = BitcoindClient::new_with_auth(
+		"http://127.0.0.1:18443",
+		Auth::UserPass("user".to_string(), "pass".to_string()),
+	)
+	.unwrap();
+	let electrs_client = ElectrumClient::new("tcp://127.0.0.1:50001").unwrap();
+
+	// Give electrs a kick.
+	generate_blocks_and_wait(&bitcoind_client, &electrs_client, 1);
+
+	// Setup LDK Node
+	let config = random_config(true);
+	let mut builder = Builder::from_config(config.node_config);
+	builder.set_chain_source_esplora("http://127.0.0.1:3002".to_string(), None);
+
+	let node = builder.build().unwrap();
+	node.start().unwrap();
+
+	// Premine some funds and distribute
+	let address = node.onchain_payment().new_address().unwrap();
+	let premine_amount = Amount::from_sat(5_000_000);
+	premine_and_distribute_funds(&bitcoind_client, &electrs_client, vec![address], premine_amount);
+
+	(node, bitcoind_client, electrs_client)
+}
+
+fn open_channel_by_node_id<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, node: &Node, external_node_id: PublicKey,
+	external_node_address: SocketAddress, funding_amount_sat: u64, push_msat: Option<u64>,
+) -> UserChannelId {
+	node.sync_wallets().unwrap();
+
+	// Open the channel
+	node.open_announced_channel(
+		external_node_id,
+		external_node_address,
+		funding_amount_sat,
+		push_msat,
+		None,
+	)
+	.unwrap();
+
+	let funding_txo = expect_channel_pending_event!(node, external_node_id);
+	wait_for_tx(electrs, funding_txo.txid);
+	generate_blocks_and_wait(bitcoind, electrs, 6);
+	node.sync_wallets().unwrap();
+	let user_channel_id = expect_channel_ready_event!(node, external_node_id);
+	user_channel_id
+}
+
+fn ldk_send_payment_to_external_node<E: ExternalLightningNode>(
+	node: &Node, external_node: &mut E, amount_msat: u64,
+) {
+	let description = external_node.description_invoice();
+	let invoice_string = external_node.create_invoice(amount_msat, description);
+	let invoice = Bolt11Invoice::from_str(&invoice_string).unwrap();
+	node.bolt11_payment().send(&invoice, None).unwrap();
+}
+
+fn ldk_check_send_payment_succeeds<E: ExternalLightningNode>(
+	node: &Node, external_node: &mut E, quantity_invoices: usize,
+) {
+	expect_event!(node, PaymentSuccessful);
+	external_node.check_receive_payment(quantity_invoices)
+}
+
+fn ldk_receive_payment_from_external_node<E: ExternalLightningNode>(
+	node: &Node, external_node: &mut E, amount_msat: u64,
+) {
+	let description = external_node.description_invoice();
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(description).unwrap());
+	let ldk_invoice =
+		node.bolt11_payment().receive(amount_msat, &invoice_description, 3600).unwrap();
+	external_node.pay_invoice(&ldk_invoice.to_string());
+
+	expect_event!(node, PaymentReceived);
+}
+
+pub(crate) fn do_ldk_opens_channel_with_external_node<E: ExternalLightningNode>(
+	external_node: &mut E,
+) {
+	// Initialize LDK node and clients
+	let (node, bitcoind_client, electrs_client) = init_setup_test_external_node();
+
+	// setup external node info
+	let (external_node_id, external_node_address) = external_node.get_node_info();
+
+	println!(
+		"Opening channel with external node: {} at {}",
+		external_node_id, external_node_address
+	);
+	// Open the channel
+	let funding_amount_sat = 2_000_000;
+	let push_msat = Some(500_000_000);
+	let user_channel_id = open_channel_by_node_id(
+		&bitcoind_client,
+		&electrs_client,
+		&node,
+		external_node_id,
+		external_node_address,
+		funding_amount_sat,
+		push_msat,
+	);
+
+	println!("Sending payment to external node");
+	// Send a payment to the external node
+	let invoice_amount_sat = 100_000_000;
+	ldk_send_payment_to_external_node(&node, external_node, invoice_amount_sat);
+	ldk_check_send_payment_succeeds(&node, external_node, 1);
+
+	println!("Sending payment to ldk");
+	// Send a payment to LDK
+	let amount_msat = 9_000_000;
+	assert!(external_node.can_send_payment(node.node_id().to_string(), amount_msat));
+	ldk_receive_payment_from_external_node(&node, external_node, amount_msat);
+
+	println!("Closing channel with external node");
+	// Close the channel
+	node.close_channel(&user_channel_id, external_node_id).unwrap();
+	expect_event!(node, ChannelClosed);
+	node.stop().unwrap();
 }
