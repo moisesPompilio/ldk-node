@@ -90,7 +90,7 @@ pub(crate) struct LSPS2ClientConfig {
 }
 
 struct LSPS2Service {
-	service_config: LSPS2ServiceConfig,
+	service_config: Arc<RwLock<LSPS2ServiceConfig>>,
 	ldk_service_config: LdkLSPS2ServiceConfig,
 }
 
@@ -130,6 +130,60 @@ pub struct LSPS2ServiceConfig {
 	pub min_payment_size_msat: u64,
 	/// The maximum payment size that we will accept when opening a channel.
 	pub max_payment_size_msat: u64,
+}
+
+/// Represents a partial update to the LSPS2 service configuration.
+///
+/// Only fields set to `Some` will be updated; fields set to `None` will be ignored.
+#[derive(Debug, Clone, Default)]
+pub struct LSPS2ServiceConfigUpdate {
+	/// Update the required token (None to remove, Some to set).
+	pub require_token: Option<Option<String>>,
+	/// Update the channel opening fee in parts-per-million.
+	pub channel_opening_fee_ppm: Option<u32>,
+	/// Update the proportional overprovisioning for the channel.
+	pub channel_over_provisioning_ppm: Option<u32>,
+	/// Update the minimum fee required for opening a channel.
+	pub min_channel_opening_fee_msat: Option<u64>,
+	/// Update the minimum number of blocks to keep the channel open.
+	pub min_channel_lifetime: Option<u32>,
+	/// Update the maximum client to_self_delay.
+	pub max_client_to_self_delay: Option<u32>,
+	/// Update the minimum payment size.
+	pub min_payment_size_msat: Option<u64>,
+	/// Update the maximum payment size.
+	pub max_payment_size_msat: Option<u64>,
+}
+
+impl LSPS2ServiceConfig {
+	/// Applies a partial update to the configuration.
+	/// Only fields present in `update` (i.e., `Some`) will be changed.
+	pub fn apply_update(&mut self, update: LSPS2ServiceConfigUpdate) {
+		if let Some(require_token) = update.require_token {
+			self.require_token = require_token;
+		}
+		if let Some(channel_opening_fee_ppm) = update.channel_opening_fee_ppm {
+			self.channel_opening_fee_ppm = channel_opening_fee_ppm;
+		}
+		if let Some(channel_over_provisioning_ppm) = update.channel_over_provisioning_ppm {
+			self.channel_over_provisioning_ppm = channel_over_provisioning_ppm;
+		}
+		if let Some(min_channel_opening_fee_msat) = update.min_channel_opening_fee_msat {
+			self.min_channel_opening_fee_msat = min_channel_opening_fee_msat;
+		}
+		if let Some(min_channel_lifetime) = update.min_channel_lifetime {
+			self.min_channel_lifetime = min_channel_lifetime;
+		}
+		if let Some(max_client_to_self_delay) = update.max_client_to_self_delay {
+			self.max_client_to_self_delay = max_client_to_self_delay;
+		}
+		if let Some(min_payment_size_msat) = update.min_payment_size_msat {
+			self.min_payment_size_msat = min_payment_size_msat;
+		}
+		if let Some(max_payment_size_msat) = update.max_payment_size_msat {
+			self.max_payment_size_msat = max_payment_size_msat;
+		}
+	}
 }
 
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
@@ -217,16 +271,29 @@ where
 		&mut self, promise_secret: [u8; 32], service_config: LSPS2ServiceConfig,
 	) -> &mut Self {
 		let ldk_service_config = LdkLSPS2ServiceConfig { promise_secret };
-		self.lsps2_service = Some(LSPS2Service { service_config, ldk_service_config });
+		self.lsps2_service = Some(LSPS2Service {
+			service_config: Arc::new(RwLock::new(service_config)),
+			ldk_service_config,
+		});
 		self
 	}
 
 	pub(crate) async fn build(self) -> Result<LiquiditySource<L>, BuildError> {
-		let liquidity_service_config = self.lsps2_service.as_ref().map(|s| {
+		let liquidity_service_config = self.lsps2_service.as_ref().and_then(|s| {
 			let lsps2_service_config = Some(s.ldk_service_config.clone());
 			let lsps5_service_config = None;
-			let advertise_service = s.service_config.advertise_service;
-			LiquidityServiceConfig { lsps2_service_config, lsps5_service_config, advertise_service }
+			let advertise_service = match s.service_config.read() {
+				Ok(cfg) => cfg.advertise_service,
+				Err(e) => {
+					log_error!(self.logger, "Failed to acquire LSPS2 service config lock: {:?}", e);
+					return None;
+				},
+			};
+			Some(LiquidityServiceConfig {
+				lsps2_service_config,
+				lsps5_service_config,
+				advertise_service,
+			})
 		});
 
 		let lsps1_client_config = self.lsps1_client.as_ref().map(|s| s.ldk_client_config.clone());
@@ -303,6 +370,13 @@ where
 
 	pub(crate) fn get_lsps2_lsp_details(&self) -> Option<(PublicKey, SocketAddress)> {
 		self.lsps2_client.as_ref().map(|s| (s.lsp_node_id, s.lsp_address.clone()))
+	}
+
+	fn get_lsps2_service_config(&self) -> Option<LSPS2ServiceConfig> {
+		self.lsps2_service
+			.as_ref()
+			.and_then(|s| s.service_config.read().ok())
+			.map(|cfg| cfg.clone()) // Clone to release lock
 	}
 
 	pub(crate) async fn handle_next_event(&self) {
@@ -485,7 +559,7 @@ where
 					self.liquidity_manager.lsps2_service_handler().as_ref()
 				{
 					let service_config = if let Some(service_config) =
-						self.lsps2_service.as_ref().map(|s| s.service_config.clone())
+						self.get_lsps2_service_config()
 					{
 						service_config
 					} else {
@@ -554,7 +628,7 @@ where
 					self.liquidity_manager.lsps2_service_handler().as_ref()
 				{
 					let service_config = if let Some(service_config) =
-						self.lsps2_service.as_ref().map(|s| s.service_config.clone())
+						self.get_lsps2_service_config()
 					{
 						service_config
 					} else {
@@ -626,9 +700,7 @@ where
 					return;
 				};
 
-				let service_config = if let Some(service_config) =
-					self.lsps2_service.as_ref().map(|s| s.service_config.clone())
-				{
+				let service_config = if let Some(service_config) = self.get_lsps2_service_config() {
 					service_config
 				} else {
 					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
@@ -998,6 +1070,27 @@ where
 		})?;
 
 		Ok(response)
+	}
+
+	pub(crate) fn lsps2_update_service_config(
+		&self, update: LSPS2ServiceConfigUpdate,
+	) -> Result<(), Error> {
+		if let Some(lsps2_service) = self.lsps2_service.as_ref() {
+			if let Ok(mut config) = lsps2_service.service_config.write() {
+				config.apply_update(update);
+				log_info!(self.logger, "Partially updated LSPS2 service configuration.");
+				Ok(())
+			} else {
+				log_error!(self.logger, "Failed to acquire LSPS2 service config lock.");
+				Err(Error::InvalidLSP2Config)
+			}
+		} else {
+			log_error!(
+				self.logger,
+				"Failed to update LSPS2 service config as LSPS2 service was not configured."
+			);
+			Err(Error::LSP2ServiceNotConfigured)
+		}
 	}
 
 	pub(crate) async fn lsps2_receive_to_jit_channel(

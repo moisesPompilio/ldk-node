@@ -963,6 +963,18 @@ impl Node {
 		))
 	}
 
+	/// Updates the LSPS2 service configuration with the provided partial update.
+	///
+	/// Returns an error if no liquidity source is configured.
+	pub fn lsps2_update_service_config(
+		&self, config_update: liquidity::LSPS2ServiceConfigUpdate,
+	) -> Result<(), Error> {
+		match self.liquidity_source.as_ref() {
+			Some(ls) => ls.lsps2_update_service_config(config_update),
+			None => Err(Error::NoLiquiditySourceConfigured),
+		}
+	}
+
 	/// Retrieve a list of known channels.
 	pub fn list_channels(&self) -> Vec<ChannelDetails> {
 		self.channel_manager.list_channels().into_iter().map(|c| c.into()).collect()

@@ -121,6 +121,12 @@ pub enum Error {
 	LiquiditySourceUnavailable,
 	/// The given operation failed due to the LSP's required opening fee being too high.
 	LiquidityFeeTooHigh,
+	/// The given LSP2 configuration is invalid.
+	InvalidLSP2Config,
+	/// The LSP2 service is not configured.
+	LSP2ServiceNotConfigured,
+	/// No liquidity source is configured.
+	NoLiquiditySourceConfigured,
 	/// The given blinded paths are invalid.
 	InvalidBlindedPaths,
 	/// Asynchronous payment services are disabled.
@@ -198,6 +204,9 @@ impl fmt::Display for Error {
 			Self::LiquidityFeeTooHigh => {
 				write!(f, "The given operation failed due to the LSP's required opening fee being too high.")
 			},
+			Self::InvalidLSP2Config => write!(f, "The given LSP2 configuration is invalid."),
+			Self::LSP2ServiceNotConfigured => write!(f, "The LSP2 service is not configured."),
+			Self::NoLiquiditySourceConfigured => write!(f, "No liquidity source is configured."),
 			Self::InvalidBlindedPaths => write!(f, "The given blinded paths are invalid."),
 			Self::AsyncPaymentServicesDisabled => {
 				write!(f, "Asynchronous payment services are disabled.")

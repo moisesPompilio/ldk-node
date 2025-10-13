@@ -1741,6 +1741,62 @@ fn lsps2_client_service_integration() {
 
 	expect_event!(payer_node, PaymentFailed);
 	assert_eq!(client_node.payment(&payment_id).unwrap().status, PaymentStatus::Failed);
+
+	////////////////////////////////////////////////////////////////////////////
+	// Test partial configuration updates on the provider side
+	////////////////////////////////////////////////////////////////////////////
+	// Update the channel opening fee to a new value
+	let new_channel_opening_fee_ppm = 20_000;
+	let new_channel_over_provisioning_ppm = 150_000; // Increase overprovisioning to 15%
+	service_node
+		.lsps2_update_service_config(ldk_node::liquidity::LSPS2ServiceConfigUpdate {
+			channel_opening_fee_ppm: Some(new_channel_opening_fee_ppm),
+			channel_over_provisioning_ppm: Some(new_channel_over_provisioning_ppm),
+			..Default::default()
+		})
+		.unwrap();
+
+	// Generate a new JIT invoice to test the updated fees
+	let jit_amount_msat = 150_000_000;
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024, None)
+		.unwrap();
+
+	// Pay the invoice and check if the new fee is applied
+	let payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	let funding_txo = expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+
+	// Calculate expected fee with the new rate
+	let new_service_fee_msat = (jit_amount_msat * new_channel_opening_fee_ppm as u64) / 1_000_000;
+	let expected_received_amount_msat = jit_amount_msat - new_service_fee_msat;
+	expect_payment_successful_event!(payer_node, Some(payment_id), None);
+	let client_payment_id =
+		expect_payment_received_event!(client_node, expected_received_amount_msat).unwrap();
+	let client_payment = client_node.payment(&client_payment_id).unwrap();
+	match client_payment.kind {
+		PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
+			assert_eq!(counterparty_skimmed_fee_msat, Some(new_service_fee_msat));
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
+
+	// Check if the new overprovisioning is applied
+	let expected_channel_overprovisioning_msat =
+		(expected_received_amount_msat * new_channel_over_provisioning_ppm as u64) / 1_000_000;
+	let expected_channel_size_sat =
+		(expected_received_amount_msat + expected_channel_overprovisioning_msat) / 1000;
+	let channel_value_sats = client_node
+		.list_channels()
+		.iter()
+		.find(|c| c.funding_txo == Some(funding_txo))
+		.unwrap()
+		.channel_value_sats;
+	assert_eq!(channel_value_sats, expected_channel_size_sat);
 }
 
 #[test]
