@@ -117,6 +117,8 @@ struct LiquiditySourceConfig {
 	lsps2_client: Option<LSPS2ClientConfig>,
 	// Act as an LSPS2 service.
 	lsps2_service: Option<LSPS2ServiceConfig>,
+	// Act as a liquidity source with manually handled requests.
+	manually_handle_liquidity_requests: bool,
 }
 
 #[derive(Clone)]
@@ -464,6 +466,20 @@ impl NodeBuilder {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
 		liquidity_source_config.lsps2_service = Some(service_config);
+		self
+	}
+
+	/// Configures whether liquidity events should be handled manually or automatically.
+	///
+	/// If set to `true`, liquidity events will not be processed automatically by the node.
+	/// Instead, they must be retrieved and handled manually using [`Node::liquidity_next_event_async`].
+	pub fn set_manually_handle_liquidity_requests(
+		&mut self, manually_handle_liquidity_requests: bool,
+	) -> &mut Self {
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.manually_handle_liquidity_requests =
+			manually_handle_liquidity_requests;
 		self
 	}
 
@@ -1591,6 +1607,9 @@ fn build_with_store_internal(
 			lsc.lsps2_service.as_ref().map(|config| {
 				liquidity_source_builder.lsps2_service(promise_secret, config.clone())
 			});
+
+			liquidity_source_builder
+				.set_manually_handle_liquidity_requests(lsc.manually_handle_liquidity_requests);
 
 			let liquidity_source = runtime
 				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;

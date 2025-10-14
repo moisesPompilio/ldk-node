@@ -590,22 +590,29 @@ impl Node {
 
 		if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 			let mut stop_liquidity_handler = self.stop_sender.subscribe();
-			let liquidity_handler = Arc::clone(&liquidity_source);
-			let liquidity_logger = Arc::clone(&self.logger);
-			self.runtime.spawn_background_task(async move {
-				loop {
-					tokio::select! {
-						_ = stop_liquidity_handler.changed() => {
-							log_debug!(
-								liquidity_logger,
-								"Stopping processing liquidity events.",
-							);
-							return;
+			if !liquidity_source.get_manually_handle_liquidity_requests() {
+				let liquidity_handler = Arc::clone(&liquidity_source);
+				let liquidity_logger = Arc::clone(&self.logger);
+				self.runtime.spawn_background_task(async move {
+					loop {
+						tokio::select! {
+							_ = stop_liquidity_handler.changed() => {
+								log_debug!(
+									liquidity_logger,
+									"Stopping processing liquidity events.",
+								);
+								return;
+							}
+							_ = liquidity_handler.handle_next_event() => {}
 						}
-						_ = liquidity_handler.handle_next_event() => {}
 					}
-				}
-			});
+				});
+			} else {
+				log_debug!(
+					self.logger,
+					"Liquidity source is configured to manually handle liquidity requests.",
+				);
+			}
 		}
 
 		log_info!(self.logger, "Startup complete.");
@@ -933,6 +940,35 @@ impl Node {
 			Arc::clone(&self.config),
 			Arc::clone(&self.logger),
 		))
+	}
+
+	/// Returns the next liquidity event, if available.
+	///
+	/// This method can only be used if the liquidity source is configured with
+	/// `manually_handle_liquidity_requests` set to `true`. If set to `false`, liquidity events
+	/// are processed automatically by the node, and this method should not be called.
+	pub async fn liquidity_next_event_async(
+		&self,
+	) -> Result<lightning_liquidity::events::LiquidityEvent, NodeError> {
+		match self.liquidity_source.as_ref() {
+			Some(ls) => ls.next_event_async().await,
+			None => Err(Error::NoLiquiditySourceConfigured),
+		}
+	}
+
+	/// Processes a liquidity event using the default LDK handling logic.
+	///
+	/// This function implements the standard way LDK processes liquidity events automatically.
+	/// It can be used in conjunction with manual handling (when `manually_handle_liquidity_requests`
+	/// is enabled), allowing selective manual processing of some events while delegating others
+	/// to default LDK processing.
+	pub async fn liquidity_process_event_defaults(
+		&self, event: lightning_liquidity::events::LiquidityEvent,
+	) -> Result<(), NodeError> {
+		match self.liquidity_source.as_ref() {
+			Some(ls) => Ok(ls.process_event_default(event).await),
+			None => Err(Error::NoLiquiditySourceConfigured),
+		}
 	}
 
 	/// Returns a liquidity handler allowing to request channels via the [bLIP-51 / LSPS1] protocol.

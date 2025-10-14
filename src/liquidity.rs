@@ -201,6 +201,7 @@ where
 	kv_store: Arc<DynStore>,
 	config: Arc<Config>,
 	logger: L,
+	manually_handle_liquidity_requests: bool,
 }
 
 impl<L: Deref> LiquiditySourceBuilder<L>
@@ -215,6 +216,7 @@ where
 		let lsps1_client = None;
 		let lsps2_client = None;
 		let lsps2_service = None;
+		let manually_handle_liquidity_requests = false;
 		Self {
 			lsps1_client,
 			lsps2_client,
@@ -227,6 +229,7 @@ where
 			kv_store,
 			config,
 			logger,
+			manually_handle_liquidity_requests,
 		}
 	}
 
@@ -275,6 +278,13 @@ where
 			service_config: Arc::new(RwLock::new(service_config)),
 			ldk_service_config,
 		});
+		self
+	}
+
+	pub(crate) fn set_manually_handle_liquidity_requests(
+		&mut self, manually_handle: bool,
+	) -> &mut Self {
+		self.manually_handle_liquidity_requests = manually_handle;
 		self
 	}
 
@@ -332,6 +342,7 @@ where
 			liquidity_manager,
 			config: self.config,
 			logger: self.logger,
+			manually_handle_liquidity_requests: self.manually_handle_liquidity_requests,
 		})
 	}
 }
@@ -350,6 +361,7 @@ where
 	liquidity_manager: Arc<LiquidityManager>,
 	config: Arc<Config>,
 	logger: L,
+	manually_handle_liquidity_requests: bool,
 }
 
 impl<L: Deref> LiquiditySource<L>
@@ -372,6 +384,10 @@ where
 		self.lsps2_client.as_ref().map(|s| (s.lsp_node_id, s.lsp_address.clone()))
 	}
 
+	pub(crate) fn get_manually_handle_liquidity_requests(&self) -> bool {
+		self.manually_handle_liquidity_requests.clone()
+	}
+
 	fn get_lsps2_service_config(&self) -> Option<LSPS2ServiceConfig> {
 		self.lsps2_service
 			.as_ref()
@@ -379,8 +395,23 @@ where
 			.map(|cfg| cfg.clone()) // Clone to release lock
 	}
 
+	pub(crate) async fn next_event_async(&self) -> Result<LiquidityEvent, Error> {
+		if !self.get_manually_handle_liquidity_requests() {
+			log_error!(
+				self.logger,
+				"Liquidity source is not configured for manual handling of events!"
+			);
+			return Err(Error::LiquiditySourceUnavailable);
+		}
+		Ok(self.liquidity_manager.next_event_async().await)
+	}
+
 	pub(crate) async fn handle_next_event(&self) {
-		match self.liquidity_manager.next_event_async().await {
+		self.process_event_default(self.liquidity_manager.next_event_async().await).await;
+	}
+
+	pub(crate) async fn process_event_default(&self, event: LiquidityEvent) {
+		match event {
 			LiquidityEvent::LSPS1Client(LSPS1ClientEvent::SupportedOptionsReady {
 				request_id,
 				counterparty_node_id,

@@ -1799,6 +1799,158 @@ fn lsps2_client_service_integration() {
 	assert_eq!(channel_value_sats, expected_channel_size_sat);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_client_service_integration_manual_event_request() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+
+	let sync_config = EsploraSyncConfig { background_sync_config: None };
+
+	// Setup three nodes: service, client, and payer
+	let channel_opening_fee_ppm = 10_000;
+	let channel_over_provisioning_ppm = 100_000;
+	let lsps2_service_config = LSPS2ServiceConfig {
+		require_token: None,
+		advertise_service: false,
+		channel_opening_fee_ppm,
+		channel_over_provisioning_ppm,
+		max_payment_size_msat: 1_000_000_000,
+		min_payment_size_msat: 0,
+		min_channel_lifetime: 100,
+		min_channel_opening_fee_msat: 0,
+		max_client_to_self_delay: 1024,
+	};
+
+	let service_config = random_config(true);
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	service_builder.set_liquidity_provider_lsps2(lsps2_service_config);
+	service_builder.set_manually_handle_liquidity_requests(true);
+	let service_node = Arc::new(service_builder.build().unwrap());
+	service_node.start().unwrap();
+
+	let service_node_id = service_node.node_id();
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+
+	let client_config = random_config(true);
+	setup_builder!(client_builder, client_config.node_config);
+	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	client_builder.set_liquidity_source_lsps2(service_node_id, service_addr, None);
+	client_builder.set_manually_handle_liquidity_requests(true);
+	let client_node = Arc::new(client_builder.build().unwrap());
+	client_node.start().unwrap();
+
+	let payer_config = random_config(true);
+	setup_builder!(payer_builder, payer_config.node_config);
+	payer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	let payer_node = payer_builder.build().unwrap();
+	payer_node.start().unwrap();
+
+	let service_addr = service_node.onchain_payment().new_address().unwrap();
+	let client_addr = client_node.onchain_payment().new_address().unwrap();
+	let payer_addr = payer_node.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 10_000_000;
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![service_addr, client_addr, payer_addr],
+		Amount::from_sat(premine_amount_sat),
+	);
+	service_node.sync_wallets().unwrap();
+	client_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+
+	// Spawn tasks to manually handle liquidity events by processing them with defaults
+	let node = Arc::clone(&service_node);
+	let service_handle = tokio::spawn(async move {
+		loop {
+			let event = node.liquidity_next_event_async().await.unwrap();
+			node.liquidity_process_event_defaults(event).await.unwrap();
+		}
+	});
+
+	let node = Arc::clone(&client_node);
+	let client_handle = tokio::spawn(async move {
+		loop {
+			let event = node.liquidity_next_event_async().await.unwrap();
+			node.liquidity_process_event_defaults(event).await.unwrap();
+		}
+	});
+
+	// Open a channel payer -> service that will allow paying the JIT invoice
+	println!("Opening channel payer_node -> service_node!");
+	open_channel(&payer_node, &service_node, 5_000_000, false, &electrsd);
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+	service_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+
+	expect_channel_ready_event!(payer_node, service_node.node_id());
+	expect_channel_ready_event!(service_node, payer_node.node_id());
+
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("asdf")).unwrap());
+	let jit_amount_msat = 100_000_000;
+
+	println!("Generating JIT invoice!");
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024, None)
+		.unwrap();
+
+	// Have the payer_node pay the invoice, therby triggering channel open service_node -> client_node.
+	println!("Paying JIT invoice!");
+	let payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+
+	let service_fee_msat = (jit_amount_msat * channel_opening_fee_ppm as u64) / 1_000_000;
+	let expected_received_amount_msat = jit_amount_msat - service_fee_msat;
+	expect_payment_successful_event!(payer_node, Some(payment_id), None);
+	let client_payment_id =
+		expect_payment_received_event!(client_node, expected_received_amount_msat).unwrap();
+	let client_payment = client_node.payment(&client_payment_id).unwrap();
+	match client_payment.kind {
+		PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => {
+			assert_eq!(counterparty_skimmed_fee_msat, Some(service_fee_msat));
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
+
+	let expected_channel_overprovisioning_msat =
+		(expected_received_amount_msat * channel_over_provisioning_ppm as u64) / 1_000_000;
+	let expected_channel_size_sat =
+		(expected_received_amount_msat + expected_channel_overprovisioning_msat) / 1000;
+	let channel_value_sats = client_node.list_channels().first().unwrap().channel_value_sats;
+	assert_eq!(channel_value_sats, expected_channel_size_sat);
+
+	println!("Generating regular invoice!");
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("asdf")).unwrap()).into();
+	let amount_msat = 5_000_000;
+	let invoice =
+		client_node.bolt11_payment().receive(amount_msat, &invoice_description, 1024).unwrap();
+
+	// Have the payer_node pay the invoice, to check regular forwards service_node -> client_node
+	// are working as expected.
+	println!("Paying regular invoice!");
+	let payment_id = payer_node.bolt11_payment().send(&invoice, None).unwrap();
+	expect_payment_successful_event!(payer_node, Some(payment_id), None);
+	expect_event!(service_node, PaymentForwarded);
+	expect_payment_received_event!(client_node, amount_msat);
+
+	// Abort the spawned tasks at the end of the test
+	service_handle.abort();
+	client_handle.abort();
+}
+
 #[test]
 fn facade_logging() {
 	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
